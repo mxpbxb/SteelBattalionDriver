@@ -35,6 +35,13 @@ Copyright (c) Oscar Sebio Cajaraville 2019.
 
 #define INTERRUPT_ENDPOINT_INDEX     (0)
 
+// Panel lights: each light is 4 bits of brightness, packed low nibble first.
+#define SBC_LED_DATA_SIZE            (34)
+#define SBC_LED_MAX_BRIGHTNESS       (0x0F)
+#define SBC_LED_FIRST_BUTTON         (4)   // Emergency Eject
+#define SBC_LED_LAST_BUTTON          (33)  // Comm 5
+#define SBC_LED_GEAR_REVERSE         (35)  // Then N, 1..5 up to 41
+
 typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 
 //
@@ -92,16 +99,20 @@ CONST HID_REPORT_DESCRIPTOR G_DefaultReportDescriptor[] = {
 	0x75, 0x08,                    //   REPORT_SIZE (8)
 	0x95, 0x02,                    //   REPORT_COUNT (2)
 	0x81, 0x02,                    //   INPUT (Data,Var,Abs)
-	0x09, 0xc2,                    //   USAGE (Weapons Select)
+	// Gear lever and tuner dial: one button per position. Shifter and Weapons
+	// Select axes have no slot in DirectInput's standard joystick layout, so
+	// apps like JoyToKey miss them.
+	0x05, 0x09,                    //   USAGE_PAGE (Button)
+	0x19, 0x28,                    //   USAGE_MINIMUM (Button 40: Reverse)
+	0x29, 0x3e,                    //   USAGE_MAXIMUM (Button 62: Dial position 15)
 	0x15, 0x00,                    //   LOGICAL_MINIMUM (0)
-	0x26, 0xff, 0x00,              //   LOGICAL_MAXIMUM (255)
-	0x75, 0x08,                    //   REPORT_SIZE (8)
+	0x25, 0x01,                    //   LOGICAL_MAXIMUM (1)
+	0x75, 0x01,                    //   REPORT_SIZE (1)
+	0x95, 0x17,                    //   REPORT_COUNT (23)
+	0x81, 0x02,                    //   INPUT (Data,Var,Abs)
+	0x75, 0x01,                    //   REPORT_SIZE (1)
 	0x95, 0x01,                    //   REPORT_COUNT (1)
-	0x81, 0x02,                    //   INPUT (Data,Var,Abs)
-	0x09, 0xc7,                    //   USAGE (Shifter)
-	0x15, 0x80,                    //   LOGICAL_MINIMUM (-128)
-	0x25, 0x7f,                    //   LOGICAL_MAXIMUM (127)
-	0x81, 0x02,                    //   INPUT (Data,Var,Abs)
+	0x81, 0x03,                    //   INPUT (Cnst,Var,Abs)
 	0xc0                           // END_COLLECTION
 };
 
@@ -219,8 +230,9 @@ typedef struct _HIDFX2_INPUT_REPORT
 	BYTE Clutch;
 	BYTE Brake;
 	BYTE Throttle;
-	BYTE Tuner;
-	CHAR Gear;
+	// Little-endian bitfield. Bits 0-6: gear R, N, 1..5 (buttons 40-46).
+	// Bits 7-22: dial positions 0..15 (buttons 47-62). Bit 23: padding.
+	BYTE GearDialButtons[3];
 } HIDFX2_INPUT_REPORT, *PHIDFX2_INPUT_REPORT;
 #include <poppack.h>
 
@@ -230,6 +242,15 @@ typedef struct _DEVICE_EXTENSION
     WDFUSBDEVICE      UsbDevice;
     WDFUSBINTERFACE   UsbInterface;
     WDFUSBPIPE        InterruptPipe;
+
+    // Output pipe that drives the panel lights. NULL if unavailable, in which
+    // case the controller still works, just without light control.
+    WDFUSBPIPE        LedPipe;
+    WDFREQUEST        LedRequest;
+    WDFMEMORY         LedMemory;
+    PUCHAR            LedBuffer;   // Only touched while LedWriteBusy is held
+    BOOLEAN           LedsValid;   // LedBuffer matches what the device last got
+    volatile LONG     LedWriteBusy;
 
     // Device descriptor for the USB device
     WDFMEMORY DeviceDescriptor;
@@ -270,6 +291,7 @@ PCHAR DbgDevicePowerString(IN WDF_POWER_DEVICE_STATE Type);
 NTSTATUS HidSteelBattalionConfigContReaderForInterruptEndPoint(PDEVICE_EXTENSION DeviceContext);
 
 EVT_WDF_USB_READER_COMPLETION_ROUTINE HidSteelBattalionEvtUsbInterruptPipeReadComplete;
+EVT_WDF_REQUEST_COMPLETION_ROUTINE HidSteelBattalionEvtLedWriteComplete;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP HidSteelBattalionEvtDriverContextCleanup;
 
 PCHAR DbgHidInternalIoctlString(IN ULONG IoControlCode);

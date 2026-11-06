@@ -10,7 +10,10 @@ Copyright (c) Oscar Sebio Caajaraville 2019.
 #include "usb.tmh"
 #endif
 
+static VOID HidSteelBattalionPrepareLeds(IN WDFDEVICE Device, IN PDEVICE_EXTENSION DeviceContext);
+
 #ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, HidSteelBattalionPrepareLeds)
 #pragma alloc_text(PAGE, HidSteelBattalionEvtDevicePrepareHardware)
 #pragma alloc_text(PAGE, HidSteelBattalionEvtDeviceD0Exit)
 #pragma alloc_text(PAGE, HidSteelBattalionConfigContReaderForInterruptEndPoint)
@@ -127,12 +130,191 @@ Return Value:
     // Tell the framework that it's okay to read less than MaximumPacketSize
     WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(devContext->InterruptPipe);
 
+    // Light control is optional: a failure here must not stop the controller.
+    HidSteelBattalionPrepareLeds(Device, devContext);
+
     //configure continuous reader
     status = HidSteelBattalionConfigContReaderForInterruptEndPoint(devContext);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_INIT, "HidSteelBattalionEvtDevicePrepareHardware Exit, Status:0x%x\n", status);
 
     return status;
+}
+
+
+static VOID HidSteelBattalionPrepareLeds
+(
+    IN WDFDEVICE Device,
+    IN PDEVICE_EXTENSION DeviceContext
+)
+/*++
+Routine Description:
+    Finds the output pipe for the panel lights and allocates the one request
+    and buffer used to write to it. If anything fails LedPipe stays NULL and the
+    lights are simply left alone.
+--*/
+{
+    NTSTATUS              status;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    BYTE                  pipeCount;
+    BYTE                  i;
+
+    PAGED_CODE();
+
+    DeviceContext->LedPipe = NULL;
+    DeviceContext->LedsValid = FALSE;
+
+    if (DeviceContext->LedRequest == NULL)
+    {
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = Device;
+        status = WdfRequestCreate(&attributes, WdfUsbTargetDeviceGetIoTarget(DeviceContext->UsbDevice), &DeviceContext->LedRequest);
+        if (!NT_SUCCESS(status))
+        {
+            DeviceContext->LedRequest = NULL;
+            TraceEvents(TRACE_LEVEL_WARNING, DBG_PNP, "WdfRequestCreate for lights failed 0x%x\n", status);
+            return;
+        }
+    }
+
+    if (DeviceContext->LedMemory == NULL)
+    {
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = Device;
+        status = WdfMemoryCreate(&attributes, NonPagedPoolNx, POOL_TAG, SBC_LED_DATA_SIZE, &DeviceContext->LedMemory, (PVOID*)&DeviceContext->LedBuffer);
+        if (!NT_SUCCESS(status))
+        {
+            DeviceContext->LedMemory = NULL;
+            TraceEvents(TRACE_LEVEL_WARNING, DBG_PNP, "WdfMemoryCreate for lights failed 0x%x\n", status);
+            return;
+        }
+    }
+
+    pipeCount = WdfUsbInterfaceGetNumConfiguredPipes(DeviceContext->UsbInterface);
+    for (i = 0; i < pipeCount; ++i)
+    {
+        WDFUSBPIPE pipe = WdfUsbInterfaceGetConfiguredPipe(DeviceContext->UsbInterface, i, NULL);
+        if (pipe != NULL && WdfUsbTargetPipeIsOutEndpoint(pipe))
+        {
+            DeviceContext->LedPipe = pipe;
+            break;
+        }
+    }
+
+    if (DeviceContext->LedPipe == NULL)
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_PNP, "No output pipe found for lights\n");
+    }
+}
+
+
+static VOID HidSteelBattalionBuildLeds(IN const SBC_INPUT_DATA* Input, OUT UCHAR Leds[SBC_LED_DATA_SIZE])
+/*++
+Routine Description:
+    Button lights stay on unless that button is held. Exactly one gear light
+    is on, matching the lever. Lights 4..33 follow the button bits in order,
+    so light N belongs to button bit N - 1.
+--*/
+{
+    const UCHAR buttons[5] = { Input->Buttons0, Input->Buttons1, Input->Buttons2, Input->Buttons3, Input->Buttons4 };
+    const int gear = Input->Gear;
+    int led;
+
+    RtlZeroMemory(Leds, SBC_LED_DATA_SIZE);
+
+    for (led = SBC_LED_FIRST_BUTTON; led <= SBC_LED_LAST_BUTTON; ++led)
+    {
+        const int bit = led - 1;
+        if ((buttons[bit / 8] & (1 << (bit % 8))) == 0)
+        {
+            Leds[led / 2] |= (UCHAR)((led & 1) ? (SBC_LED_MAX_BRIGHTNESS << 4) : SBC_LED_MAX_BRIGHTNESS);
+        }
+    }
+
+    if (gear >= -2 && gear <= 5 && gear != 0)
+    {
+        led = SBC_LED_GEAR_REVERSE + (gear < 0 ? gear + 2 : gear + 1);
+        Leds[led / 2] |= (UCHAR)((led & 1) ? (SBC_LED_MAX_BRIGHTNESS << 4) : SBC_LED_MAX_BRIGHTNESS);
+    }
+}
+
+
+static VOID HidSteelBattalionUpdateLeds(IN PDEVICE_EXTENSION DeviceContext, IN const SBC_INPUT_DATA* Input)
+/*++
+Routine Description:
+    Sends the lights to the device if they changed. Called from the reader at
+    up to DISPATCH_LEVEL. Only one write runs at a time; a change that arrives
+    during a write is picked up by the next report, as the device reports
+    continuously.
+--*/
+{
+    UCHAR    leds[SBC_LED_DATA_SIZE];
+    NTSTATUS status;
+
+    if (DeviceContext->LedPipe == NULL)
+    {
+        return;
+    }
+
+    HidSteelBattalionBuildLeds(Input, leds);
+
+    if (InterlockedCompareExchange(&DeviceContext->LedWriteBusy, 1, 0) != 0)
+    {
+        return;
+    }
+
+    if (DeviceContext->LedsValid && RtlEqualMemory(leds, DeviceContext->LedBuffer, SBC_LED_DATA_SIZE))
+    {
+        InterlockedExchange(&DeviceContext->LedWriteBusy, 0);
+        return;
+    }
+
+    // A failed write is not retried until the lights change again, so a device
+    // that rejects writes can't turn this into a tight loop at the report rate.
+    RtlCopyMemory(DeviceContext->LedBuffer, leds, SBC_LED_DATA_SIZE);
+    DeviceContext->LedsValid = TRUE;
+
+    status = WdfUsbTargetPipeFormatRequestForWrite(DeviceContext->LedPipe, DeviceContext->LedRequest, DeviceContext->LedMemory, NULL);
+    if (NT_SUCCESS(status))
+    {
+        WdfRequestSetCompletionRoutine(DeviceContext->LedRequest, HidSteelBattalionEvtLedWriteComplete, DeviceContext);
+        if (WdfRequestSend(DeviceContext->LedRequest, WdfUsbTargetPipeGetIoTarget(DeviceContext->LedPipe), WDF_NO_SEND_OPTIONS))
+        {
+            return; // The completion routine releases LedWriteBusy
+        }
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_IOCTL, "WdfRequestSend for lights failed\n");
+    }
+
+    {
+        WDF_REQUEST_REUSE_PARAMS reuse;
+        WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+        WdfRequestReuse(DeviceContext->LedRequest, &reuse);
+    }
+    InterlockedExchange(&DeviceContext->LedWriteBusy, 0);
+}
+
+
+VOID HidSteelBattalionEvtLedWriteComplete
+(
+    IN WDFREQUEST Request,
+    IN WDFIOTARGET Target,
+    IN PWDF_REQUEST_COMPLETION_PARAMS Params,
+    IN WDFCONTEXT Context
+)
+{
+    PDEVICE_EXTENSION        devContext = Context;
+    WDF_REQUEST_REUSE_PARAMS reuse;
+
+    UNREFERENCED_PARAMETER(Target);
+
+    if (!NT_SUCCESS(Params->IoStatus.Status))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_IOCTL, "Light write failed 0x%x\n", Params->IoStatus.Status);
+    }
+
+    WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+    WdfRequestReuse(Request, &reuse);
+    InterlockedExchange(&devContext->LedWriteBusy, 0);
 }
 
 
@@ -235,6 +417,10 @@ Return Value:
 
 	PSBC_INPUT_DATA sbcData = (PSBC_INPUT_DATA)inputData;
 
+	// Before the HID queue check below: lights must track the controller even
+	// when no application has the device open.
+	HidSteelBattalionUpdateLeds(devContext, sbcData);
+
 	HIDFX2_INPUT_REPORT r;
 	r.Buttons0 = sbcData->Buttons0;
 	r.Buttons1 = sbcData->Buttons1;
@@ -249,8 +435,20 @@ Return Value:
 	r.Clutch = (BYTE)(((int)sbcData->Clutch) / 256);
 	r.Brake = (BYTE)(((int)sbcData->Brake) / 256);
 	r.Throttle = (BYTE)(((int)sbcData->Throttle) / 256);
-	r.Tuner = sbcData->Tuner;
-	r.Gear = sbcData->Gear < 0 ? sbcData->Gear + 1 : sbcData->Gear;
+
+	// One button per position. The lever reports -2 (R), -1 (N) or 1..5, and the
+	// dial position is the low nibble of its byte.
+	{
+		const int gear = sbcData->Gear;
+		ULONG extra = 1UL << (7 + (sbcData->Tuner & 0x0F));
+		if (gear >= -2 && gear <= 5 && gear != 0)
+		{
+			extra |= 1UL << (gear < 0 ? gear + 2 : gear + 1);
+		}
+		r.GearDialButtons[0] = (BYTE)(extra & 0xFF);
+		r.GearDialButtons[1] = (BYTE)((extra >> 8) & 0xFF);
+		r.GearDialButtons[2] = (BYTE)((extra >> 16) & 0xFF);
+	}
 
 	NTSTATUS status;
 	WDFREQUEST request;
@@ -322,6 +520,13 @@ Return Value:
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_PNP, "HidSteelBattalionEvtDeviceD0Entry Enter - coming from %s\n", DbgDevicePowerString(PreviousState));
 
+	// Resend the lights after any power-up, as the device may have lost them.
+	devContext->LedsValid = FALSE;
+	if (devContext->LedPipe != NULL)
+	{
+		(VOID)WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(devContext->LedPipe));
+	}
+
 	status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(devContext->InterruptPipe));
 
     TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, "HidSteelBattalionEvtDeviceD0Entry Exit, status: 0x%x\n", status);
@@ -375,7 +580,12 @@ Return Value:
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_PNP, "HidSteelBattalionEvtDeviceD0Exit Enter- moving to %s\n", DbgDevicePowerString(TargetState));
 
     devContext = GetDeviceContext(Device);
+    // Reader first, so no new light writes start once the light pipe is stopped.
     WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(devContext->InterruptPipe), WdfIoTargetCancelSentIo);
+    if (devContext->LedPipe != NULL)
+    {
+        WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(devContext->LedPipe), WdfIoTargetCancelSentIo);
+    }
 
     TraceEvents(TRACE_LEVEL_ERROR, DBG_PNP, "HidSteelBattalionEvtDeviceD0Exit Exit\n");
 
