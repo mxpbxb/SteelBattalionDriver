@@ -20,9 +20,13 @@ The driver also runs the panel lights by itself, with no app needed:
 - The light for the current gear is on, and the other gear lights are off.
 - Every other button light is on, and goes off only while that button is held.
 
+### Download
+
+The driver is on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases). It's signed with a test certificate, not a trusted one, so Windows must be in test signing mode with Secure Boot off.
+
 ### Building and signing
 
-Builds with Visual Studio 2022 and the Windows Driver Kit. Build from a short path, as long paths break the build tools. This fork publishes no signed driver: a build needs your own test certificate, and Windows must be in test signing mode to load it.
+Builds with Visual Studio 2022 and the Windows Driver Kit. Build from a short path, as long paths break the build tools. A build needs your own test certificate, and Windows must be in test signing mode to load it.
 
 ## How to install the driver
 
