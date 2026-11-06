@@ -18,7 +18,8 @@ The Shifter and Weapons Select axes are gone, so apps that read those two axes d
 The driver also runs the panel lights by itself, with no app needed:
 
 - The light for the current gear is on, and the other gear lights are off.
-- Every other button light is on, and goes off only while that button is held.
+- With the dial on button 60 (position 13), every other button light is on, and goes off only while that button is held.
+- On any other dial position, those lights are off, and come on only while that button is held.
 
 ### Download
 

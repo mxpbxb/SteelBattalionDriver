@@ -41,6 +41,7 @@ Copyright (c) Oscar Sebio Cajaraville 2019.
 #define SBC_LED_FIRST_BUTTON         (4)   // Emergency Eject
 #define SBC_LED_LAST_BUTTON          (33)  // Comm 5
 #define SBC_LED_GEAR_REVERSE         (35)  // Then N, 1..5 up to 41
+#define SBC_DIAL_LIT_UNLESS_HELD     (13)  // Dial position, reported as button 60
 
 typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 

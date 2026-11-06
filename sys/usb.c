@@ -211,13 +211,16 @@ Routine Description:
 static VOID HidSteelBattalionBuildLeds(IN const SBC_INPUT_DATA* Input, OUT UCHAR Leds[SBC_LED_DATA_SIZE])
 /*++
 Routine Description:
-    Button lights stay on unless that button is held. Exactly one gear light
-    is on, matching the lever. Lights 4..33 follow the button bits in order,
+    With the dial on SBC_DIAL_LIT_UNLESS_HELD, button lights stay on unless
+    that button is held. On any other dial position that inverts, and a button
+    light is on only while held. Exactly one gear light is on, matching the
+    lever, whatever the dial says. Lights 4..33 follow the button bits in order,
     so light N belongs to button bit N - 1.
 --*/
 {
     const UCHAR buttons[5] = { Input->Buttons0, Input->Buttons1, Input->Buttons2, Input->Buttons3, Input->Buttons4 };
     const int gear = Input->Gear;
+    const BOOLEAN litUnlessHeld = (Input->Tuner & 0x0F) == SBC_DIAL_LIT_UNLESS_HELD;
     int led;
 
     RtlZeroMemory(Leds, SBC_LED_DATA_SIZE);
@@ -225,7 +228,8 @@ Routine Description:
     for (led = SBC_LED_FIRST_BUTTON; led <= SBC_LED_LAST_BUTTON; ++led)
     {
         const int bit = led - 1;
-        if ((buttons[bit / 8] & (1 << (bit % 8))) == 0)
+        const BOOLEAN held = (buttons[bit / 8] & (1 << (bit % 8))) != 0;
+        if (held != litUnlessHeld)
         {
             Leds[led / 2] |= (UCHAR)((led & 1) ? (SBC_LED_MAX_BRIGHTNESS << 4) : SBC_LED_MAX_BRIGHTNESS);
         }
