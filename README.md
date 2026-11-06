@@ -4,6 +4,23 @@ A Windows 64bit Driver for the Steel Battalion controller
 
 This driver will let you use your old Steel Battalion controller as a USB-HID gamepad in a windows system.
 
+## Use it without test signing
+
+Release 0.6 adds `SteelBattalionFeeder`, a small tray app that replaces the custom driver, so Windows test signing is no longer needed.
+
+The controller runs on Microsoft's own WinUSB driver. The app reads it, runs the panel lights, and passes the inputs to [vJoy](https://github.com/BrunnerInnovation/vJoy), a virtual joystick with a Microsoft-signed driver. Buttons and lights behave the same as the driver below, but the app has to be running.
+
+| Control | vJoy output |
+|---|---|
+| Aim stick | X, Y |
+| Rotation | Z |
+| Sight stick | Rx, Ry |
+| Brake | Rz |
+| Clutch | Slider 1 |
+| Throttle | Slider 2 |
+| Buttons, gear lever and dial | Same button numbers as the driver, 1-62 |
+
+To build it, run `feeder\build.cmd` with Visual Studio 2022 installed. Install steps are in the release notes on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases).
 ## What this fork changes
 
 This fork makes the gear lever and tuner dial usable in apps that read DirectInput's standard joystick layout, such as JoyToKey, and adds panel light control.
@@ -23,7 +40,7 @@ The driver also runs the panel lights by itself, with no app needed:
 
 ### Download
 
-The driver is on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases). It's signed with a test certificate, not a trusted one, so Windows must be in test signing mode with Secure Boot off.
+The driver is on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases) as version 0.5. It's signed with a test certificate, not a trusted one, so Windows must be in test signing mode with Secure Boot off.
 
 ### Building and signing
 
