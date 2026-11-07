@@ -2,14 +2,17 @@
 SteelBattalionFeeder: drives the Steel Battalion controller without a custom
 kernel driver, so Windows test signing is not needed.
 
-  controller --(WinUSB, in-box Microsoft driver)--> this app --> vJoy --> games
+  controller --(WinUSB, in-box Microsoft driver)--> this app --> vJoy or a
+  virtual Xbox 360 controller (ViGEmBus) --> games and emulators
 
 Usage:
   SteelBattalionFeeder.exe                  Run in the tray
   SteelBattalionFeeder.exe --verbose        Run and log every input change
+  SteelBattalionFeeder.exe --vjoy or --xbox  Start in that mode, or switch the running app to it
   SteelBattalionFeeder.exe --setup [--quiet] Configure vJoy and bind WinUSB (elevates)
 
-Log: %LOCALAPPDATA%\SteelBattalionFeeder\feeder.log
+Settings: %LOCALAPPDATA%\SteelBattalionFeeder\settings.ini
+Log:      %LOCALAPPDATA%\SteelBattalionFeeder\feeder.log
 */
 
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +28,7 @@ Log: %LOCALAPPDATA%\SteelBattalionFeeder\feeder.log
 #include <stdio.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <ViGEm/Client.h>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "newdev.lib")
@@ -50,6 +54,9 @@ Log: %LOCALAPPDATA%\SteelBattalionFeeder\feeder.log
 #define LED_LAST_BUTTON      33
 #define LED_GEAR_REVERSE     35
 #define DIAL_LIT_UNLESS_HELD 13   /* Dial position reported as button 60 */
+#define DIAL_RUMBLE_FLASH    14   /* Button 61: lit while held, flash on rumble */
+#define DIAL_ALL_OFF         15   /* Button 62: every light off */
+#define FLASH_HALF_PERIOD_MS 60
 
 #define REPORT_MIN_SIZE      26
 
@@ -107,6 +114,11 @@ static wchar_t g_status[128] = L"Starting";
 #define WM_STATUS     (WM_APP + 2)
 #define MENU_AUTOSTART 101
 #define MENU_EXIT      102
+#define MENU_VJOY      103
+#define MENU_XBOX      104
+#define MENU_SETTINGS  105
+#define MENU_RELOAD    106
+#define MENU_CENTER    107
 
 /* ---- Logging ---- */
 
@@ -197,14 +209,192 @@ static BOOL VjoyAcquire(void)
     return TRUE;
 }
 
+/* ---- Settings ---- */
+
+typedef enum { MODE_VJOY, MODE_XBOX } OUTPUT_MODE;
+static volatile LONG g_mode = MODE_VJOY;
+
+enum { AX_AIMX, AX_AIMY, AX_ROTATION, AX_SIGHTX, AX_SIGHTY, AX_CLUTCH, AX_BRAKE, AX_THROTTLE, AX_COUNT };
+static const wchar_t *const AXIS_NAMES[AX_COUNT] =
+    { L"aimX", L"aimY", L"rotation", L"sightX", L"sightY", L"clutch", L"brake", L"throttle" };
+
+typedef struct { LONG min, center, max, dead; } AXIS_CAL;
+/* In 0..32767 units, seeded from a real controller. Min and max widen as the
+   controller reports further. The aim stick does not return to one exact spot,
+   so it needs a wide dead zone. */
+static AXIS_CAL g_cal[AX_COUNT] = {
+    { 8480, 16900, 22368, 3000 }, { 736, 15500, 23648, 3000 }, { 1000, 16384, 32000, 1000 },
+    { 2848, 16400, 31200, 1200 }, { 6048, 15400, 29152, 1200 },
+    { 0, 0, 32767, 500 }, { 0, 0, 32767, 500 }, { 0, 0, 32767, 500 } };
+
+typedef struct { const wchar_t *key; USHORT flag; unsigned long long buttons; } XBOX_BUTTON;
+static XBOX_BUTTON g_xboxButtons[] = {
+    { L"A", XUSB_GAMEPAD_A }, { L"B", XUSB_GAMEPAD_B }, { L"X", XUSB_GAMEPAD_X }, { L"Y", XUSB_GAMEPAD_Y },
+    { L"LB", XUSB_GAMEPAD_LEFT_SHOULDER }, { L"RB", XUSB_GAMEPAD_RIGHT_SHOULDER },
+    { L"Back", XUSB_GAMEPAD_BACK }, { L"Start", XUSB_GAMEPAD_START }, { L"Guide", XUSB_GAMEPAD_GUIDE },
+    { L"LS", XUSB_GAMEPAD_LEFT_THUMB }, { L"RS", XUSB_GAMEPAD_RIGHT_THUMB },
+    { L"Up", XUSB_GAMEPAD_DPAD_UP }, { L"Down", XUSB_GAMEPAD_DPAD_DOWN },
+    { L"Left", XUSB_GAMEPAD_DPAD_LEFT }, { L"Right", XUSB_GAMEPAD_DPAD_RIGHT } };
+#define XBOX_BUTTON_COUNT (sizeof(g_xboxButtons) / sizeof(g_xboxButtons[0]))
+
+typedef struct { const wchar_t *key; int axis; BOOL invert; unsigned long long buttons; } XBOX_ANALOG;
+enum { XA_LT, XA_RT, XA_LX, XA_LY, XA_RX, XA_RY, XA_COUNT };
+static XBOX_ANALOG g_xboxAnalog[XA_COUNT] = {
+    { L"LT", -1 }, { L"RT", -1 }, { L"LeftX", -1 }, { L"LeftY", -1 }, { L"RightX", -1 }, { L"RightY", -1 } };
+
+static CRITICAL_SECTION g_mapLock;
+static LONG g_lastAxis[AX_COUNT];
+static BOOL g_lastAxisValid;
+
+static const char DEFAULT_SETTINGS[] =
+    "; Steel Battalion Feeder settings. After editing, right-click the tray icon and\n"
+    "; choose Reload settings.\n"
+    ";\n"
+    "; Xbox buttons take one or more controller button numbers, such as A=2 or A=2,23.\n"
+    "; Leave a value empty to leave it unassigned.\n"
+    ";\n"
+    ";  1 Main Weapon     2 Fire            3 Lock-On         4 Eject\n"
+    ";  5 Cockpit Hatch   6 Ignition        7 Start           8 Open/Close\n"
+    ";  9 Map Zoom       10 Mode Select    11 Sub Monitor    12 Main Zoom In\n"
+    "; 13 Main Zoom Out  14 FSS            15 Manipulator    16 Line Color\n"
+    "; 17 Washing        18 Extinguisher   19 Chaff          20 Tank Detach\n"
+    "; 21 Override       22 Night Scope    23 F1             24 F2\n"
+    "; 25 F3             26 Weapon Main    27 Weapon Sub     28 Magazine\n"
+    "; 29-33 Comm 1-5    34 Sight Change   35 Filter         36 Oxygen\n"
+    "; 37 Fuel Flow      38 Buffer         39 VT Location\n"
+    "; 40-46 Gear R, N, 1-5                47-62 Dial 0-15\n"
+    ";\n"
+    "; Sticks and triggers take an axis: aimX aimY rotation sightX sightY clutch brake\n"
+    "; throttle. Put a minus in front to reverse a stick. Triggers can also take\n"
+    "; button numbers.\n"
+    "\n"
+    "[Output]\n"
+    "; vjoy or xbox. The tray menu changes this too.\n"
+    "Mode=vjoy\n"
+    "\n"
+    "[Xbox]\n"
+    "A=2\nB=3\nX=1\nY=34\nLB=26\nRB=27\nBack=6\nStart=7\nGuide=\nLS=4\nRS=5\n"
+    "Up=29\nDown=30\nLeft=31\nRight=32\n"
+    "LT=brake\nRT=throttle\nLeftX=aimX\nLeftY=-aimY\nRightX=sightX\nRightY=-sightY\n";
+
+static BOOL SettingsPath(wchar_t *path)
+{
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH - 64) return FALSE;
+    wcscat_s(path, MAX_PATH, L"\\" APP_NAME);
+    CreateDirectoryW(path, NULL);
+    wcscat_s(path, MAX_PATH, L"\\settings.ini");
+    return TRUE;
+}
+
+static unsigned long long ParseButtons(const wchar_t *text)
+{
+    unsigned long long bits = 0;
+    const wchar_t *p = text;
+    while (*p)
+    {
+        wchar_t *end;
+        const long n = wcstol(p, &end, 10);
+        if (end == p) break;
+        if (n >= 1 && n <= VJOY_BUTTONS) bits |= 1ULL << (n - 1);
+        p = end;
+        while (*p == L',' || *p == L' ') ++p;
+    }
+    return bits;
+}
+
+static void ParseAnalog(const wchar_t *text, XBOX_ANALOG *out)
+{
+    const wchar_t *name = text;
+    int i;
+    out->axis = -1;
+    out->invert = FALSE;
+    out->buttons = 0;
+    while (*name == L' ') ++name;
+    if (*name == L'-') { out->invert = TRUE; ++name; }
+    for (i = 0; i < AX_COUNT; ++i)
+    {
+        if (_wcsicmp(name, AXIS_NAMES[i]) == 0) { out->axis = i; return; }
+    }
+    out->buttons = ParseButtons(text);
+}
+
+static void LoadSettings(void)
+{
+    wchar_t path[MAX_PATH], value[128];
+    size_t i;
+    if (!SettingsPath(path)) return;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
+    {
+        FILE *file = NULL;
+        _wfopen_s(&file, path, L"w");
+        if (file) { fputs(DEFAULT_SETTINGS, file); fclose(file); }
+    }
+    EnterCriticalSection(&g_mapLock);
+    for (i = 0; i < XBOX_BUTTON_COUNT; ++i)
+    {
+        GetPrivateProfileStringW(L"Xbox", g_xboxButtons[i].key, L"", value, 128, path);
+        g_xboxButtons[i].buttons = ParseButtons(value);
+    }
+    for (i = 0; i < XA_COUNT; ++i)
+    {
+        GetPrivateProfileStringW(L"Xbox", g_xboxAnalog[i].key, L"", value, 128, path);
+        ParseAnalog(value, &g_xboxAnalog[i]);
+    }
+    for (i = 0; i < AX_COUNT; ++i)
+    {
+        AXIS_CAL c;
+        GetPrivateProfileStringW(L"Calibration", AXIS_NAMES[i], L"", value, 128, path);
+        if (swscanf_s(value, L"%ld,%ld,%ld,%ld", &c.min, &c.center, &c.max, &c.dead) == 4 && c.min <= c.center && c.center <= c.max)
+            g_cal[i] = c;
+    }
+    LeaveCriticalSection(&g_mapLock);
+    GetPrivateProfileStringW(L"Output", L"Mode", L"vjoy", value, 128, path);
+    InterlockedExchange(&g_mode, _wcsicmp(value, L"xbox") == 0 ? MODE_XBOX : MODE_VJOY);
+}
+
+static void SaveCalibration(void)
+{
+    wchar_t path[MAX_PATH], value[128];
+    int i;
+    if (!SettingsPath(path)) return;
+    EnterCriticalSection(&g_mapLock);
+    for (i = 0; i < AX_COUNT; ++i)
+    {
+        swprintf_s(value, 128, L"%ld,%ld,%ld,%ld", g_cal[i].min, g_cal[i].center, g_cal[i].max, g_cal[i].dead);
+        WritePrivateProfileStringW(L"Calibration", AXIS_NAMES[i], value, path);
+    }
+    LeaveCriticalSection(&g_mapLock);
+}
+
+static void SaveMode(LONG mode)
+{
+    wchar_t path[MAX_PATH];
+    if (SettingsPath(path)) WritePrivateProfileStringW(L"Output", L"Mode", mode == MODE_XBOX ? L"xbox" : L"vjoy", path);
+}
+
+/* Uses the sticks' current resting spot as center, fixing drift */
+static void RecenterSticks(void)
+{
+    int i;
+    EnterCriticalSection(&g_mapLock);
+    if (g_lastAxisValid)
+    {
+        for (i = AX_AIMX; i <= AX_SIGHTY; ++i) g_cal[i].center = g_lastAxis[i];
+    }
+    LeaveCriticalSection(&g_mapLock);
+    SaveCalibration();
+    Log("sticks recentered");
+}
+
 /* ---- Mapping ---- */
 
 static LONG AxisU(USHORT raw) { return (LONG)(raw >> 1); }
 static LONG AxisS(SHORT raw)  { return (LONG)(((int)raw + 32768) >> 1); }
 
-static void BuildPosition(const SBC_REPORT *r, VJOY_POSITION *p)
+/* Buttons 1..39 are the raw bits, 40..46 gear R, N, 1..5, 47..62 dial 0..15 */
+static unsigned long long ReportButtons(const SBC_REPORT *r)
 {
-    /* Buttons 1..39 are the raw bits, 40..46 gear R, N, 1..5, 47..62 dial 0..15 */
     unsigned long long bits = 0;
     int i;
     const int gear = r->gear;
@@ -213,7 +403,12 @@ static void BuildPosition(const SBC_REPORT *r, VJOY_POSITION *p)
     if (gear >= -2 && gear <= 5 && gear != 0)
         bits |= 1ULL << (39 + (gear < 0 ? gear + 2 : gear + 1));
     bits |= 1ULL << (39 + 7 + (r->tuner & 0x0F));
+    return bits;
+}
 
+static void BuildPosition(const SBC_REPORT *r, VJOY_POSITION *p)
+{
+    const unsigned long long bits = ReportButtons(r);
     ZeroMemory(p, sizeof(*p));
     p->bDevice = VJOY_ID;
     p->wAxisX = AxisU(r->aimX);
@@ -230,6 +425,77 @@ static void BuildPosition(const SBC_REPORT *r, VJOY_POSITION *p)
     p->bHats = p->bHatsEx1 = p->bHatsEx2 = p->bHatsEx3 = 0xFFFFFFFF;
 }
 
+static SHORT ScaleStick(LONG v, const AXIS_CAL *c, BOOL invert)
+{
+    const LONG off = v - c->center;
+    const LONG size = off < 0 ? -off : off;
+    const LONG span = (off < 0 ? c->center - c->min : c->max - c->center) - c->dead;
+    LONG out;
+    if (size <= c->dead || span <= 0) return 0;
+    out = (LONG)(((long long)(size - c->dead) * 32767) / span);
+    if (out > 32767) out = 32767;
+    if (off < 0) out = -out;
+    return (SHORT)(invert ? -out : out);
+}
+
+static BYTE ScaleTrigger(LONG v, const AXIS_CAL *c)
+{
+    const LONG span = c->max - c->min - c->dead;
+    const LONG size = v - c->min - c->dead;
+    LONG out;
+    if (size <= 0 || span <= 0) return 0;
+    out = (LONG)(((long long)size * 255) / span);
+    return (BYTE)(out > 255 ? 255 : out);
+}
+
+static SHORT AnalogStick(const XBOX_ANALOG *a, const LONG *axes, unsigned long long bits)
+{
+    if (a->axis >= 0) return ScaleStick(axes[a->axis], &g_cal[a->axis], a->invert);
+    return (bits & a->buttons) ? (SHORT)(a->invert ? -32767 : 32767) : 0;
+}
+
+static BYTE AnalogTrigger(const XBOX_ANALOG *a, const LONG *axes, unsigned long long bits)
+{
+    if (a->axis >= 0) return ScaleTrigger(axes[a->axis], &g_cal[a->axis]);
+    return (bits & a->buttons) ? 255 : 0;
+}
+
+static void BuildXbox(const SBC_REPORT *r, XUSB_REPORT *x)
+{
+    const unsigned long long bits = ReportButtons(r);
+    LONG axes[AX_COUNT];
+    size_t i;
+    axes[AX_AIMX] = AxisU(r->aimX);
+    axes[AX_AIMY] = AxisU(r->aimY);
+    axes[AX_ROTATION] = AxisS(r->rotation);
+    axes[AX_SIGHTX] = AxisS(r->sightX);
+    axes[AX_SIGHTY] = AxisS(r->sightY);
+    axes[AX_CLUTCH] = AxisU(r->clutch);
+    axes[AX_BRAKE] = AxisU(r->brake);
+    axes[AX_THROTTLE] = AxisU(r->throttle);
+
+    ZeroMemory(x, sizeof(*x));
+    EnterCriticalSection(&g_mapLock);
+    for (i = 0; i < AX_COUNT; ++i)
+    {
+        if (axes[i] < g_cal[i].min) g_cal[i].min = axes[i];
+        if (axes[i] > g_cal[i].max) g_cal[i].max = axes[i];
+        g_lastAxis[i] = axes[i];
+    }
+    g_lastAxisValid = TRUE;
+    for (i = 0; i < XBOX_BUTTON_COUNT; ++i)
+    {
+        if (bits & g_xboxButtons[i].buttons) x->wButtons |= g_xboxButtons[i].flag;
+    }
+    x->bLeftTrigger = AnalogTrigger(&g_xboxAnalog[XA_LT], axes, bits);
+    x->bRightTrigger = AnalogTrigger(&g_xboxAnalog[XA_RT], axes, bits);
+    x->sThumbLX = AnalogStick(&g_xboxAnalog[XA_LX], axes, bits);
+    x->sThumbLY = AnalogStick(&g_xboxAnalog[XA_LY], axes, bits);
+    x->sThumbRX = AnalogStick(&g_xboxAnalog[XA_RX], axes, bits);
+    x->sThumbRY = AnalogStick(&g_xboxAnalog[XA_RY], axes, bits);
+    LeaveCriticalSection(&g_mapLock);
+}
+
 static void NeutralPosition(VJOY_POSITION *p)
 {
     ZeroMemory(p, sizeof(*p));
@@ -238,24 +504,38 @@ static void NeutralPosition(VJOY_POSITION *p)
     p->bHats = p->bHatsEx1 = p->bHatsEx2 = p->bHatsEx3 = 0xFFFFFFFF;
 }
 
-static void SetLed(BYTE *leds, int led)
+/* Strongest rumble motor the game asked for, 0..255 (Xbox mode only) */
+static volatile LONG g_rumble;
+
+static void SetLedLevel(BYTE *leds, int led, BYTE level)
 {
-    leds[led / 2] |= (BYTE)((led & 1) ? (LED_MAX << 4) : LED_MAX);
+    leds[led / 2] &= (BYTE)((led & 1) ? 0x0F : 0xF0);
+    leds[led / 2] |= (BYTE)((led & 1) ? (level << 4) : level);
 }
 
-/* Same behaviour as driver 0.5: dial on 13 means lit unless held, any other
-   position means lit only while held. One gear light follows the lever. */
+static void SetLed(BYTE *leds, int led) { SetLedLevel(leds, led, LED_MAX); }
+
+/* Dial on 13 (button 60): lit unless held. Dial on 14 (button 61): lit while
+   held, and the others flash while the game rumbles, brighter for stronger
+   rumble. Dial on 15 (button 62): everything off. Any other position: lit
+   only while held. One gear light follows the lever. */
 static void BuildLeds(const SBC_REPORT *r, BYTE *leds)
 {
-    const BOOL litUnlessHeld = (r->tuner & 0x0F) == DIAL_LIT_UNLESS_HELD;
+    const int dial = r->tuner & 0x0F;
+    const BOOL litUnlessHeld = dial == DIAL_LIT_UNLESS_HELD;
+    const LONG rumble = g_rumble;
+    const BOOL flashOn = dial == DIAL_RUMBLE_FLASH && rumble > 0 && (GetTickCount() / FLASH_HALF_PERIOD_MS) % 2 == 0;
+    const BYTE flashLevel = (BYTE)(1 + rumble * (LED_MAX - 1) / 255);
     const int gear = r->gear;
     int led;
     ZeroMemory(leds, LED_DATA_SIZE);
+    if (dial == DIAL_ALL_OFF) return;
     for (led = LED_FIRST_BUTTON; led <= LED_LAST_BUTTON; ++led)
     {
         const int bit = led - 1;
         const BOOL held = (r->buttons[bit / 8] & (1 << (bit % 8))) != 0;
         if (held != litUnlessHeld) SetLed(leds, led);
+        else if (flashOn) SetLedLevel(leds, led, flashLevel);
     }
     if (gear >= -2 && gear <= 5 && gear != 0)
         SetLed(leds, LED_GEAR_REVERSE + (gear < 0 ? gear + 2 : gear + 1));
@@ -354,7 +634,7 @@ static BOOL OpenController(CONTROLLER *c)
         CloseController(c);
         return FALSE;
     }
-    timeout = 500;
+    timeout = 50; /* short, so lights keep flashing if reports pause */
     WinUsb_SetPipePolicy(c->usb, c->inPipe, PIPE_TRANSFER_TIMEOUT, sizeof(timeout), &timeout);
     if (c->outPipe)
     {
@@ -371,47 +651,149 @@ static void WriteLeds(CONTROLLER *c, const BYTE *leds)
         Log("light write failed: %lu", GetLastError());
 }
 
-static void LogChanges(const VJOY_POSITION *a, const VJOY_POSITION *b)
+static void LogChanges(VJOY_POSITION *logged, const VJOY_POSITION *b)
 {
-    unsigned long long x = ((unsigned long long)(unsigned long)a->lButtonsEx1 << 32) | (unsigned long)a->lButtons;
+    unsigned long long x = ((unsigned long long)(unsigned long)logged->lButtonsEx1 << 32) | (unsigned long)logged->lButtons;
     unsigned long long y = ((unsigned long long)(unsigned long)b->lButtonsEx1 << 32) | (unsigned long)b->lButtons;
     int i;
     for (i = 0; i < VJOY_BUTTONS; ++i)
     {
         if (((x ^ y) >> i) & 1) Log("button %d %s", i + 1, ((y >> i) & 1) ? "down" : "up");
     }
-#define AXIS(name, field) if (labs(a->field - b->field) > 400) Log("%s %ld", name, b->field)
+    logged->lButtons = b->lButtons;
+    logged->lButtonsEx1 = b->lButtonsEx1;
+#define AXIS(name, field) if (labs(logged->field - b->field) > 400) { Log("%s %ld", name, b->field); logged->field = b->field; }
     AXIS("aimX", wAxisX); AXIS("aimY", wAxisY); AXIS("rotation", wAxisZ);
     AXIS("sightX", wAxisXRot); AXIS("sightY", wAxisYRot);
     AXIS("brake", wAxisZRot); AXIS("clutch", wSlider); AXIS("throttle", wDial);
 #undef AXIS
 }
 
+/* ---- Output ---- */
+
+static PVIGEM_CLIENT g_vigem;
+static PVIGEM_TARGET g_xboxPad;
+
+static void XboxClose(void)
+{
+    if (g_xboxPad)
+    {
+        vigem_target_x360_unregister_notification(g_xboxPad);
+        InterlockedExchange(&g_rumble, 0);
+        vigem_target_remove(g_vigem, g_xboxPad);
+        vigem_target_free(g_xboxPad);
+        g_xboxPad = NULL;
+    }
+    if (g_vigem)
+    {
+        vigem_disconnect(g_vigem);
+        vigem_free(g_vigem);
+        g_vigem = NULL;
+    }
+}
+
+static VOID CALLBACK OnRumble(PVIGEM_CLIENT client, PVIGEM_TARGET target, UCHAR large, UCHAR small, UCHAR ledNumber, LPVOID user)
+{
+    UNREFERENCED_PARAMETER(client); UNREFERENCED_PARAMETER(target);
+    UNREFERENCED_PARAMETER(ledNumber); UNREFERENCED_PARAMETER(user);
+    InterlockedExchange(&g_rumble, large > small ? large : small);
+    if (g_verbose) Log("rumble large=%u small=%u", large, small);
+}
+
+static BOOL XboxOpen(void)
+{
+    VIGEM_ERROR error;
+    g_vigem = vigem_alloc();
+    if (!g_vigem) return FALSE;
+    error = vigem_connect(g_vigem);
+    if (!VIGEM_SUCCESS(error))
+    {
+        Log("ViGEmBus connect failed: 0x%08X", (unsigned)error);
+        SetStatus(L"ViGEmBus is not installed");
+        XboxClose();
+        return FALSE;
+    }
+    g_xboxPad = vigem_target_x360_alloc();
+    error = g_xboxPad ? vigem_target_add(g_vigem, g_xboxPad) : VIGEM_ERROR_NO_FREE_SLOT;
+    if (!VIGEM_SUCCESS(error))
+    {
+        Log("virtual Xbox pad failed: 0x%08X", (unsigned)error);
+        SetStatus(L"Could not create the Xbox controller");
+        if (g_xboxPad) { vigem_target_free(g_xboxPad); g_xboxPad = NULL; }
+        XboxClose();
+        return FALSE;
+    }
+    error = vigem_target_x360_register_notification(g_vigem, g_xboxPad, OnRumble, NULL);
+    if (!VIGEM_SUCCESS(error)) Log("rumble notifications unavailable: 0x%08X", (unsigned)error);
+    Log("virtual Xbox pad created");
+    return TRUE;
+}
+
+static BOOL OutputOpen(LONG mode) { return mode == MODE_XBOX ? XboxOpen() : VjoyAcquire(); }
+
+static void OutputNeutral(LONG mode)
+{
+    if (mode == MODE_XBOX)
+    {
+        XUSB_REPORT x;
+        ZeroMemory(&x, sizeof(x));
+        if (g_xboxPad) vigem_target_x360_update(g_vigem, g_xboxPad, x);
+    }
+    else
+    {
+        VJOY_POSITION p;
+        NeutralPosition(&p);
+        if (pUpdateVJD) pUpdateVJD(VJOY_ID, &p);
+    }
+}
+
+static void OutputClose(LONG mode)
+{
+    OutputNeutral(mode);
+    if (mode == MODE_XBOX) XboxClose();
+    else if (pRelinquishVJD) pRelinquishVJD(VJOY_ID);
+}
+
 static DWORD WINAPI Worker(LPVOID unused)
 {
-    static BOOL announced;
+    LONG active = -1;
+    CONTROLLER c = { 0 };
+    BOOL controllerOpen = FALSE;
     UNREFERENCED_PARAMETER(unused);
     while (!g_quit)
     {
-        CONTROLLER c;
-        VJOY_POSITION last, now;
         BYTE lastLeds[LED_DATA_SIZE], leds[LED_DATA_SIZE];
-        BOOL ledsValid = FALSE;
-        VJOY_POSITION logged;
+        BYTE lastReport[64];
+        BOOL ledsValid = FALSE, announced = FALSE, haveReport = FALSE;
+        VJOY_POSITION last, now, logged;
+        XUSB_REPORT lastXbox, nowXbox;
+        BOOL xboxValid = FALSE;
+        DWORD lastXboxSend = 0;
+        int nudgesLeft = 3;
+        const LONG mode = g_mode;
 
-        if (!VjoyAcquire()) { WaitForSingleObject(g_quitEvent, 2000); continue; }
-        if (!OpenController(&c))
+        if (active != mode)
         {
-            SetStatus(L"Controller not found");
-            WaitForSingleObject(g_quitEvent, 1000);
-            continue;
+            if (active != -1) OutputClose(active);
+            active = -1;
+            if (!OutputOpen(mode)) { WaitForSingleObject(g_quitEvent, 2000); continue; }
+            active = mode;
         }
-        SetStatus(L"Running");
+        if (!controllerOpen)
+        {
+            if (!OpenController(&c))
+            {
+                SetStatus(L"Controller not found");
+                WaitForSingleObject(g_quitEvent, 1000);
+                continue;
+            }
+            controllerOpen = TRUE;
+        }
+        SetStatus(mode == MODE_XBOX ? L"Running as Xbox controller" : L"Running as vJoy");
         NeutralPosition(&last);
         logged = last;
-        announced = FALSE;
 
-        while (!g_quit)
+        while (!g_quit && g_mode == active)
         {
             BYTE buffer[64];
             ULONG got = 0;
@@ -419,8 +801,26 @@ static DWORD WINAPI Worker(LPVOID unused)
             if (!WinUsb_ReadPipe(c.usb, c.inPipe, buffer, sizeof(buffer), &got, NULL))
             {
                 const DWORD error = GetLastError();
-                if (error == ERROR_SEM_TIMEOUT) continue;
+                if (error == ERROR_SEM_TIMEOUT)
+                {
+                    /* No new report: still redraw the lights from the last one */
+                    if (haveReport)
+                    {
+                        BuildLeds((const SBC_REPORT *)lastReport, leds);
+                        if (!ledsValid || memcmp(leds, lastLeds, LED_DATA_SIZE) != 0)
+                        {
+                            WriteLeds(&c, leds);
+                            memcpy(lastLeds, leds, LED_DATA_SIZE);
+                            ledsValid = TRUE;
+                        }
+                    }
+                    continue;
+                }
                 Log("read failed: %lu", error);
+                CloseController(&c);
+                controllerOpen = FALSE;
+                OutputNeutral(active);
+                SetStatus(L"Controller disconnected");
                 break;
             }
             if (got < REPORT_MIN_SIZE)
@@ -428,11 +828,38 @@ static DWORD WINAPI Worker(LPVOID unused)
                 if (!announced) { Log("short report: %lu bytes", got); announced = TRUE; }
                 continue;
             }
+            memcpy(lastReport, buffer, sizeof(lastReport));
+            haveReport = TRUE;
             BuildPosition(report, &now);
-            if (memcmp(&now, &last, sizeof(now)) != 0)
+            if (g_verbose) LogChanges(&logged, &now);
+            if (active == MODE_XBOX)
+            {
+                BuildXbox(report, &nowXbox);
+                const BOOL changed = !xboxValid || memcmp(&nowXbox, &lastXbox, sizeof(nowXbox)) != 0;
+                /* A new pad shows random stick values until it gets a report that
+                   isn't all zeros, which a controller at rest would never send.
+                   So nudge it a few times just as it starts up. */
+                if (changed || GetTickCount() - lastXboxSend > 500)
+                {
+                    if (nudgesLeft > 0)
+                    {
+                        XUSB_REPORT nudge = nowXbox;
+                        if (nudge.sThumbLX == 0) nudge.sThumbLX = 1;
+                        vigem_target_x360_update(g_vigem, g_xboxPad, nudge);
+                        Sleep(5);
+                        --nudgesLeft;
+                    }
+                    const VIGEM_ERROR error = vigem_target_x360_update(g_vigem, g_xboxPad, nowXbox);
+                    if (g_verbose && changed) Log("xbox btn=%04X lt=%u rt=%u L=%d,%d R=%d,%d", nowXbox.wButtons, nowXbox.bLeftTrigger, nowXbox.bRightTrigger, nowXbox.sThumbLX, nowXbox.sThumbLY, nowXbox.sThumbRX, nowXbox.sThumbRY);
+                    if (!VIGEM_SUCCESS(error)) Log("Xbox update failed: 0x%08X", (unsigned)error);
+                    lastXbox = nowXbox;
+                    lastXboxSend = GetTickCount();
+                    xboxValid = TRUE;
+                }
+            }
+            else if (memcmp(&now, &last, sizeof(now)) != 0)
             {
                 if (!pUpdateVJD(VJOY_ID, &now)) Log("vJoy update failed");
-                if (g_verbose) { LogChanges(&logged, &now); logged = now; }
                 last = now;
             }
             BuildLeds(report, leds);
@@ -443,19 +870,16 @@ static DWORD WINAPI Worker(LPVOID unused)
                 ledsValid = TRUE;
             }
         }
-
-        /* Nothing stays held and no lights stay on once we stop reading */
-        NeutralPosition(&now);
-        pUpdateVJD(VJOY_ID, &now);
-        if (g_quit)
-        {
-            ZeroMemory(leds, LED_DATA_SIZE);
-            WriteLeds(&c, leds);
-        }
-        CloseController(&c);
-        if (!g_quit) SetStatus(L"Controller disconnected");
     }
-    if (pRelinquishVJD) pRelinquishVJD(VJOY_ID);
+    /* Nothing stays held and no lights stay on once we stop */
+    if (active != -1) OutputClose(active);
+    if (controllerOpen)
+    {
+        BYTE off[LED_DATA_SIZE];
+        ZeroMemory(off, LED_DATA_SIZE);
+        WriteLeds(&c, off);
+        CloseController(&c);
+    }
     return 0;
 }
 
@@ -625,10 +1049,10 @@ static int RunSetup(BOOL quiet)
     if (!quiet)
     {
         swprintf_s(message, 256, L"vJoy buttons and axes: %s\nController on WinUSB: %s\n\nDetails are in feeder.log.",
-            vjoy ? L"done" : L"FAILED", usb ? L"done" : L"FAILED");
-        MessageBoxW(NULL, message, L"Steel Battalion Feeder setup", (vjoy && usb) ? MB_ICONINFORMATION : MB_ICONERROR);
+            vjoy ? L"done" : L"not set (only needed for vJoy mode)", usb ? L"done" : L"FAILED");
+        MessageBoxW(NULL, message, L"Steel Battalion Feeder setup", usb ? MB_ICONINFORMATION : MB_ICONERROR);
     }
-    return (vjoy && usb) ? 0 : 1;
+    return usb ? 0 : 1;
 }
 
 static int ElevateSetup(BOOL quiet)
@@ -709,6 +1133,13 @@ static void TrayMenu(HWND hwnd)
     LeaveCriticalSection(&g_statusLock);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_mode == MODE_XBOX ? MF_CHECKED : 0), MENU_XBOX, L"Xbox controller (games and emulators)");
+    AppendMenuW(menu, MF_STRING | (g_mode == MODE_VJOY ? MF_CHECKED : 0), MENU_VJOY, L"vJoy (JoyToKey, all 62 buttons)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, MENU_CENTER, L"Recenter sticks");
+    AppendMenuW(menu, MF_STRING, MENU_SETTINGS, L"Edit settings");
+    AppendMenuW(menu, MF_STRING, MENU_RELOAD, L"Reload settings");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), MENU_AUTOSTART, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, MENU_EXIT, L"Exit");
     GetCursorPos(&pt);
@@ -731,7 +1162,20 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         TrayUpdate(hwnd, NIM_MODIFY);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == MENU_AUTOSTART) AutostartSet(!AutostartEnabled());
+        if (LOWORD(wp) == MENU_VJOY || LOWORD(wp) == MENU_XBOX)
+        {
+            const LONG mode = LOWORD(wp) == MENU_XBOX ? MODE_XBOX : MODE_VJOY;
+            InterlockedExchange(&g_mode, mode);
+            SaveMode(mode);
+        }
+        else if (LOWORD(wp) == MENU_CENTER) RecenterSticks();
+        else if (LOWORD(wp) == MENU_RELOAD) LoadSettings();
+        else if (LOWORD(wp) == MENU_SETTINGS)
+        {
+            wchar_t path[MAX_PATH];
+            if (SettingsPath(path)) ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+        }
+        else if (LOWORD(wp) == MENU_AUTOSTART) AutostartSet(!AutostartEnabled());
         else if (LOWORD(wp) == MENU_EXIT) DestroyWindow(hwnd);
         return 0;
     case WM_CLOSE:
@@ -751,6 +1195,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdLine, int show)
     HANDLE mutex, worker;
     MSG msg;
     BOOL setup, quiet;
+    LONG forcedMode = -1;
 
     UNREFERENCED_PARAMETER(prev);
     UNREFERENCED_PARAMETER(show);
@@ -758,6 +1203,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdLine, int show)
     setup = wcsstr(cmdLine, L"--setup") != NULL;
     quiet = wcsstr(cmdLine, L"--quiet") != NULL;
     g_verbose = wcsstr(cmdLine, L"--verbose") != NULL;
+    if (wcsstr(cmdLine, L"--vjoy")) forcedMode = MODE_VJOY;
+    else if (wcsstr(cmdLine, L"--xbox")) forcedMode = MODE_XBOX;
 
     if (setup)
     {
@@ -770,10 +1217,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdLine, int show)
     }
 
     mutex = CreateMutexW(NULL, FALSE, L"Local\\" APP_NAME);
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        HWND running = FindWindowW(WINDOW_CLASS, NULL);
+        if (running && forcedMode >= 0) PostMessageW(running, WM_COMMAND, forcedMode == MODE_XBOX ? MENU_XBOX : MENU_VJOY, 0);
+        return 0;
+    }
 
     LogOpen(L"w");
     InitializeCriticalSection(&g_statusLock);
+    InitializeCriticalSection(&g_mapLock);
+    LoadSettings();
+    if (forcedMode >= 0)
+    {
+        InterlockedExchange(&g_mode, forcedMode);
+        SaveMode(forcedMode);
+    }
     g_quitEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 
     ZeroMemory(&wc, sizeof(wc));
@@ -799,6 +1258,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdLine, int show)
         WaitForSingleObject(worker, 3000);
         CloseHandle(worker);
     }
+    SaveCalibration();
     if (g_log) fclose(g_log);
     if (mutex) CloseHandle(mutex);
     return 0;

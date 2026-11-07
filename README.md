@@ -6,21 +6,32 @@ This driver will let you use your old Steel Battalion controller as a USB-HID ga
 
 ## Use it without test signing
 
-Release 0.6 adds `SteelBattalionFeeder`, a small tray app that replaces the custom driver, so Windows test signing is no longer needed.
+`SteelBattalionFeeder` is a small tray app that replaces the custom driver, so Windows test signing is no longer needed. The controller runs on Microsoft's own WinUSB driver, and the app reads it, runs the panel lights and passes the inputs on. It has two output modes, picked from the tray menu:
 
-The controller runs on Microsoft's own WinUSB driver. The app reads it, runs the panel lights, and passes the inputs to [vJoy](https://github.com/BrunnerInnovation/vJoy), a virtual joystick with a Microsoft-signed driver. Buttons and lights behave the same as the driver below, but the app has to be running.
+- **vJoy** (from 0.6): all 62 buttons on a [vJoy](https://github.com/BrunnerInnovation/vJoy) virtual joystick, for JoyToKey and anything else that reads joysticks.
+- **Xbox controller** (from 0.7): a virtual Xbox 360 controller through [ViGEmBus](https://github.com/nefarius/ViGEmBus), for games and emulators that only take XInput pads. Button and stick mapping is set in `settings.ini` (tray menu > Edit settings).
 
-| Control | vJoy output |
+| Control | vJoy output | Xbox output (default) |
+|---|---|---|
+| Aim stick | X, Y | Left stick |
+| Rotation | Z | |
+| Sight stick | Rx, Ry | Right stick |
+| Brake | Rz | Left trigger |
+| Clutch | Slider 1 | |
+| Throttle | Slider 2 | Right trigger |
+| Buttons, gear lever and dial | Same button numbers as the driver, 1-62 | Set in `settings.ini` |
+
+The tuner dial switches how the button lights behave:
+
+| Dial position (button) | Button lights |
 |---|---|
-| Aim stick | X, Y |
-| Rotation | Z |
-| Sight stick | Rx, Ry |
-| Brake | Rz |
-| Clutch | Slider 1 |
-| Throttle | Slider 2 |
-| Buttons, gear lever and dial | Same button numbers as the driver, 1-62 |
+| 13 (60) | On, off while held |
+| 14 (61) | On while held, and flash while the game rumbles (Xbox mode only) |
+| 15 (62) | All off, gear lights too |
+| Any other | On while held |
 
-To build it, run `feeder\build.cmd` with Visual Studio 2022 installed. Install steps are in the release notes on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases).
+To build it, run `feeder\build.cmd` with Visual Studio 2022 installed. Install steps are in the release notes on the [releases page](https://github.com/mxpbxb/SteelBattalionDriver/releases). `feeder\vigem` is the ViGEmClient library (MIT licence).
+
 ## What this fork changes
 
 This fork makes the gear lever and tuner dial usable in apps that read DirectInput's standard joystick layout, such as JoyToKey, and adds panel light control.
